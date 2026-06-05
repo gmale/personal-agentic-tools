@@ -1,0 +1,834 @@
+#!/bin/zsh
+#
+# cl - launch & manage Claude Code sessions
+#
+# Launches `claude` with --dangerously-skip-permissions by default, and keeps a
+# catalog of your sessions so you can list and resume them by id or alias.
+#
+# Files (override locations with env vars):
+#   CL_DIR           ${XDG_CONFIG_HOME:-~/.config}/cl
+#   CL_SESSIONS      $CL_DIR/sessions.json   (GENERATED - never hand-edit)
+#   CL_ALIASES       $CL_DIR/aliases.json    (USER-curated alias -> session id map)
+#   CLAUDE_CONFIG_DIR  defaults to ~/.claude  (where session transcripts live)
+#
+# Usage:
+#   cl                       launch a fresh claude in the current directory
+#   cl ls                    list all sessions (newest first), alias-annotated
+#   cl scan                  (re)generate the sessions catalog
+#   cl <alias|id|short-id>   cd to the session's path and resume it
+#   cl alias <name> <id>     map an alias to a session id (creates/updates aliases.json)
+#   cl unalias <name>        remove an alias
+#   cl path                  print the config dir
+#   cl help                  this help
+#
+# Any extra args after a known form are passed through to `claude`.
+# Set CL_SAFE=1 (or pass --safe) to drop --dangerously-skip-permissions.
+
+set -u
+emulate -L zsh
+
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+PROJECTS_DIR="$CLAUDE_CONFIG_DIR/projects"
+
+CL_DIR="${CL_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cl}"
+CL_SESSIONS="${CL_SESSIONS:-$CL_DIR/sessions.json}"
+CL_ALIASES="${CL_ALIASES:-$CL_DIR/aliases.json}"
+CL_FORKS="${CL_FORKS:-$CL_DIR/forks.json}"   # durable child->parent provenance
+
+PY=python3
+
+# dangerous-by-default flag
+DANGER_FLAG=(--dangerously-skip-permissions)
+if [[ "${CL_SAFE:-0}" == "1" ]]; then
+  DANGER_FLAG=()
+fi
+
+DRYRUN=0
+FORK=0
+
+die() { print -u2 "cl: $*"; exit 1; }
+
+# launch: the ONE place that runs (or, with -n, would run) claude.
+# $1 = target cwd ("" = current dir); remaining args = claude argv.
+# Always prints the exact, copy-pasteable command; only execs when not -n.
+launch() {
+  local target_cwd="$1"; shift
+  local -a cmd=("$CLAUDE_BIN" "$@")
+  local -a q=("${(@q)cmd}")           # shell-quote each argv element
+  local line="${(j: :)q}"
+  if [[ -n "$target_cwd" ]]; then
+    line="cd ${(q)target_cwd} && $line"
+  fi
+  print -r -- "$line"
+  (( DRYRUN )) && return 0
+  if [[ -n "$target_cwd" ]]; then
+    cd "$target_cwd" || die "cannot cd to $target_cwd"
+  fi
+  exec "${cmd[@]}"
+}
+
+ensure_dir() { [[ -d "$CL_DIR" ]] || mkdir -p "$CL_DIR"; }
+
+# --- scan: parse ~/.claude/projects/*/*.jsonl -> sessions.json -----------------
+scan() {
+  ensure_dir
+  PROJECTS_DIR="$PROJECTS_DIR" CL_SESSIONS="$CL_SESSIONS" CL_FORKS="$CL_FORKS" "$PY" - <<'PYEOF'
+import json, os, glob, datetime
+
+projects = os.environ["PROJECTS_DIR"]
+out_path = os.environ["CL_SESSIONS"]
+forks_path = os.environ["CL_FORKS"]
+sessions = []
+uuid_sets = {}      # session id -> set of its message uuids (for ancestry containment)
+CONTAIN_THR = 0.98  # A is an ancestor of B if >= this fraction of A's history is in B
+
+# prefixes that mark a system-injected / resume preamble rather than a real ask
+NOISE = ("this session is being continued", "<local-command", "<command-",
+         "caveat:", "<system-reminder", "welcome back")
+
+def msg_text(m):
+    if not isinstance(m, dict):
+        return None
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        for part in c:
+            if isinstance(part, dict) and part.get("type") == "text":
+                return part.get("text")
+    return None
+
+for f in glob.glob(os.path.join(projects, "*", "*.jsonl")):
+    sid = os.path.splitext(os.path.basename(f))[0]
+    cwd = None
+    title = None
+    first_prompt = None
+    last_prompt = None
+    last_ts = None
+    msgs = 0
+    ctx_tokens = 0          # context size on the most recent assistant turn
+    compactions = 0         # number of compaction events
+    logical_parent = None   # logicalParentUuid (branch root, for orphan annotation)
+    muuids = set()          # this session's message uuids
+    try:
+        with open(f, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                if logical_parent is None and d.get("logicalParentUuid"):
+                    logical_parent = d["logicalParentUuid"]
+                if d.get("cwd"):
+                    cwd = d["cwd"]
+                if d.get("type") == "ai-title" and d.get("aiTitle"):
+                    title = d["aiTitle"]
+                if d.get("compactMetadata"):
+                    compactions += 1
+                t = d.get("timestamp")
+                if t:
+                    last_ts = t
+                typ = d.get("type")
+                if typ in ("user", "assistant"):
+                    msgs += 1
+                    if d.get("uuid"):
+                        muuids.add(d["uuid"])
+                if typ == "assistant":
+                    u = (d.get("message") or {}).get("usage")
+                    if isinstance(u, dict):
+                        tot = (u.get("input_tokens", 0)
+                               + u.get("cache_read_input_tokens", 0)
+                               + u.get("cache_creation_input_tokens", 0))
+                        if tot:
+                            ctx_tokens = tot   # keep the last non-zero turn
+                if typ == "user":
+                    txt = msg_text(d.get("message"))
+                    if txt:
+                        clean = " ".join(txt.split())
+                        if clean and not clean.lower().startswith(NOISE):
+                            if first_prompt is None:
+                                first_prompt = clean[:300]
+                            last_prompt = clean[:300]
+    except Exception:
+        pass
+
+    uuid_sets[sid] = muuids
+    sessions.append({
+        "id": sid,
+        "short": sid[:8],
+        "cwd": cwd,
+        "title": title,            # AI title when present (fallback only)
+        "first": first_prompt,
+        "last": last_prompt,
+        "last_used": last_ts,
+        "messages": msgs,
+        "ctx_tokens": ctx_tokens,
+        "compactions": compactions,
+        "_logical_parent": logical_parent,    # internal: consumed below
+    })
+
+# --- resolve provenance: child -> parent session ------------------------------
+# Forks copy the whole ancestry's messages (uuids included), so a single uuid
+# lives in every descendant -- "who owns this uuid" is meaningless. Instead infer
+# ancestry by containment: A is an ancestor of B when ~all of A's message history
+# is also in B; the immediate parent is the *largest* such contained ancestor.
+present = {s["id"] for s in sessions}
+
+def containment_parent(bid):
+    sb = uuid_sets.get(bid) or set()
+    if not sb:
+        return None
+    best, best_sz = None, -1
+    for aid, sa in uuid_sets.items():
+        if aid == bid or not sa or len(sa) >= len(sb):
+            continue
+        if len(sa & sb) / len(sa) >= CONTAIN_THR and len(sa) > best_sz:
+            best, best_sz = aid, len(sa)
+    return best
+
+# forks.json schema: { child_id: {"manual": parent_id?, "auto": parent_id?} }
+# Both signals coexist -- `manual` is your recorded truth, `auto` is the latest
+# containment guess; neither clobbers the other. Effective parent = manual if
+# set, else auto. Auto is re-derived each scan; an auto edge to a now-pruned
+# parent is kept (durable -- it can't be recomputed once the parent is gone).
+forks = {}
+if os.path.exists(forks_path):
+    try:
+        raw = json.load(open(forks_path)) or {}
+        for child, v in raw.items():
+            e = {}
+            if isinstance(v, dict):
+                if v.get("manual"): e["manual"] = v["manual"]
+                if v.get("auto"):   e["auto"] = v["auto"]
+                if v.get("parent"):                     # migrate old single-field form
+                    e.setdefault(v.get("source") if v.get("source") in ("manual", "auto") else "auto", v["parent"])
+            elif isinstance(v, str):                    # migrate legacy flat string
+                e["auto"] = v
+            if e: forks[child] = e
+    except Exception:
+        forks = {}
+
+manual_count = auto_count = 0
+for s in sessions:
+    sid = s["id"]
+    entry = forks.get(sid, {})
+    derived = containment_parent(sid)
+    if derived:
+        entry["auto"] = derived                          # refresh the guess
+    else:
+        a = entry.get("auto")
+        if a and a in present:                           # containment no longer supports it
+            entry.pop("auto", None)                      # drop stale (keep pruned-parent autos)
+    if entry:
+        forks[sid] = entry
+    else:
+        forks.pop(sid, None)
+    manual, auto = entry.get("manual"), entry.get("auto")
+    parent = manual or auto                              # effective: manual wins
+    s["parent"] = parent
+    s["parent_source"] = "manual" if manual else ("auto" if auto else None)
+    s["parent_auto"] = auto                              # kept for conflict display
+    s["parent_present"] = bool(parent) and parent in present
+    if manual: manual_count += 1
+    elif auto: auto_count += 1
+    lp = s.pop("_logical_parent")
+    s["branch_uuid"] = lp[:8] if lp else None
+
+tmpf = forks_path + ".tmp"
+with open(tmpf, "w") as fh:
+    json.dump(forks, fh, indent=2)
+os.replace(tmpf, forks_path)
+edge_count = manual_count + auto_count
+
+# newest first; sessions without a timestamp sort to the bottom
+sessions.sort(key=lambda s: (s["last_used"] or ""), reverse=True)
+
+doc = {
+    "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "count": len(sessions),
+    "sessions": sessions,
+}
+tmp = out_path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(doc, fh, indent=2)
+os.replace(tmp, out_path)
+msg = f"{len(sessions)} sessions -> {out_path}"
+if edge_count:
+    extra = f"{edge_count} fork edge{'s' if edge_count != 1 else ''}"
+    if manual_count:
+        extra += f", {manual_count} manual"
+    msg += f"  ({extra})"
+print(msg)
+PYEOF
+}
+
+# rescan if catalog is missing or any project transcript is newer than it
+scan_if_stale() {
+  [[ -d "$PROJECTS_DIR" ]] || die "no projects dir at $PROJECTS_DIR"
+  if [[ ! -f "$CL_SESSIONS" ]]; then
+    scan >/dev/null
+    return
+  fi
+  local newest
+  newest=$(find "$PROJECTS_DIR" -name '*.jsonl' -newer "$CL_SESSIONS" -print -quit 2>/dev/null)
+  # rescan if a transcript changed, or if fork edges were edited (add-fork/hand-edit).
+  # scan writes forks.json before sessions.json, so this is false right after a scan.
+  if [[ -n "$newest" || "$CL_FORKS" -nt "$CL_SESSIONS" ]]; then
+    scan >/dev/null
+  fi
+}
+
+# --- ls: render the catalog (+ aliases) ---------------------------------------
+list_sessions() {
+  scan_if_stale
+  CL_SESSIONS="$CL_SESSIONS" CL_ALIASES="$CL_ALIASES" "$PY" - <<'PYEOF'
+import json, os, sys, datetime, shutil
+
+sessions = json.load(open(os.environ["CL_SESSIONS"]))["sessions"]
+aliases = {}
+ap = os.environ["CL_ALIASES"]
+if os.path.exists(ap):
+    try:
+        aliases = json.load(open(ap)) or {}
+    except Exception:
+        pass
+# id -> all aliases for it (so duplicates are visible, never silently hidden)
+by_id = {}
+for name, sid in aliases.items():
+    by_id.setdefault(sid, []).append(name)
+by_id = {sid: ",".join(names) for sid, names in by_id.items()}
+
+tty = sys.stdout.isatty()
+def c(s, code): return f"\033[{code}m{s}\033[0m" if tty else s
+term_w = shutil.get_terminal_size((100, 24)).columns
+
+def rel(ts):
+    if not ts:
+        return "-"
+    try:
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return ts[:10]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    d = now - t
+    s = d.total_seconds()
+    if s < 0: s = 0
+    if s < 3600:   return f"{int(s//60)}m ago"
+    if s < 86400:  return f"{int(s//3600)}h ago"
+    if s < 86400*30: return f"{int(s//86400)}d ago"
+    return t.date().isoformat()
+
+def home(p):
+    if not p: return "(no path)"
+    h = os.path.expanduser("~")
+    return "~" + p[len(h):] if p.startswith(h) else p
+
+def ctx(s):
+    n = s.get("ctx_tokens") or 0
+    comp = s.get("compactions") or 0
+    if n <= 0:
+        cell = "-"
+    elif n >= 1000:
+        cell = f"{n/1000:.0f}k"
+    else:
+        cell = str(n)
+    if comp:
+        cell += f" ⟳{comp}"
+    return cell
+
+def trunc(s, n):
+    return s if len(s) <= n else s[:n-1] + "…"
+
+SEP = " → "
+# session arc: first meaningful ask → latest, budgeting width so both show
+# (latest gets the larger share since it reflects current state)
+def describe(s, width):
+    first, last = s.get("first"), s.get("last")
+    if first and last and first != last:
+        fpart = trunc(first, max(18, int(width * 0.42)))
+        lpart = trunc(last, width - len(fpart) - len(SEP))
+        return fpart + SEP + lpart
+    if first or last:
+        return trunc(first or last, width)
+    return s.get("title") or "(no prompts)"
+
+# --- line 1: aligned metadata columns ---
+meta = []
+for s in sessions:
+    meta.append([
+        by_id.get(s["id"], ""),
+        s["short"],
+        rel(s["last_used"]),
+        str(s["messages"]),
+        ctx(s),
+        home(s["cwd"]),
+    ])
+hdr = ("ALIAS", "ID", "LAST USED", "MSGS", "CTX", "PATH")
+widths = [len(h) for h in hdr]
+for r in meta:
+    for i, v in enumerate(r):
+        widths[i] = max(widths[i], len(v))
+
+def meta_line(cells):
+    return "  ".join(v.ljust(widths[i]) for i, v in enumerate(cells))
+
+INDENT = "    ↳ "
+desc_w = max(20, term_w - len(INDENT))
+
+rule = c("┈" * term_w, "2;37")  # faint dotted divider between entries
+
+print(c(meta_line(hdr), "1;36"))
+for i, (s, cells) in enumerate(zip(sessions, meta)):
+    if i:
+        print(rule)
+    print(meta_line(cells))
+    print(c(INDENT + describe(s, desc_w), "2;37"))
+if not sessions:
+    print("(no sessions found)")
+PYEOF
+}
+
+# --- tree: visualize fork provenance (child sessions under their parent) -------
+tree_sessions() {
+  scan_if_stale
+  CL_SESSIONS="$CL_SESSIONS" CL_ALIASES="$CL_ALIASES" "$PY" - <<'PYEOF'
+import json, os, sys, datetime, shutil
+
+sessions = json.load(open(os.environ["CL_SESSIONS"]))["sessions"]
+aliases = {}
+ap = os.environ["CL_ALIASES"]
+if os.path.exists(ap):
+    try: aliases = json.load(open(ap)) or {}
+    except Exception: aliases = {}
+alias_of = {}
+for name, sid in aliases.items():
+    alias_of.setdefault(sid, name)
+
+tty = sys.stdout.isatty()
+def c(s, code): return f"\033[{code}m{s}\033[0m" if tty else s
+term_w = shutil.get_terminal_size((100, 24)).columns
+
+def rel(ts):
+    if not ts: return "-"
+    try:
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return ts[:10]
+    d = datetime.datetime.now(datetime.timezone.utc) - t
+    s = max(0, d.total_seconds())
+    if s < 3600:     return f"{int(s//60)}m ago"
+    if s < 86400:    return f"{int(s//3600)}h ago"
+    if s < 86400*30: return f"{int(s//86400)}d ago"
+    return t.date().isoformat()
+
+def trunc(s, n):
+    return s if len(s) <= n else s[:n-1] + "…"
+
+def ctx(s):
+    n = s.get("ctx_tokens") or 0
+    comp = s.get("compactions") or 0
+    cell = "-" if n <= 0 else (f"{n/1000:.0f}k" if n >= 1000 else str(n))
+    if comp: cell += f" ⟳{comp}"
+    return cell
+
+SEP = " → "
+def describe(s, width):
+    first, last = s.get("first"), s.get("last")
+    if width < 12: return ""
+    if first and last and first != last:
+        fpart = trunc(first, max(12, int(width * 0.42)))
+        lpart = trunc(last, width - len(fpart) - len(SEP))
+        return fpart + SEP + lpart
+    if first or last:
+        return trunc(first or last, width)
+    return s.get("title") or "(no prompts)"
+
+ids = {s["id"] for s in sessions}
+by = {s["id"]: s for s in sessions}
+kids, roots = {}, []
+for s in sessions:
+    p = s.get("parent")
+    if p and p in ids:
+        kids.setdefault(p, []).append(s["id"])
+    else:
+        roots.append(s["id"])
+
+def lastkey(sid): return by[sid].get("last_used") or ""
+roots.sort(key=lastkey, reverse=True)
+for k in kids: kids[k].sort(key=lastkey, reverse=True)
+
+had_pruned = False
+def note_for(s):
+    global had_pruned
+    p = s.get("parent")
+    if p and p not in ids:        # durable edge to a parent that's been pruned
+        had_pruned = True
+        return f"⟵ {p[:8]} (pruned)"
+    if not p and s.get("branch_uuid"):  # root that branched from a deleted ancestor
+        had_pruned = True
+        return f"⟵ ‹pruned {s['branch_uuid']}›"
+    return ""
+
+def render(sid, prefix, is_last, depth):
+    s = by[sid]
+    if depth == 0:
+        connector = ""
+    else:
+        arm = "┄ " if s.get("parent_source") == "auto" else "─ "  # dotted = inferred
+        connector = ("└" if is_last else "├") + arm
+    name = alias_of.get(sid) or s["short"]
+    parts = []
+    if alias_of.get(sid): parts.append(s["short"])
+    parts.append(rel(s.get("last_used")))
+    cx = ctx(s)
+    if cx != "-": parts.append(cx)
+    meta = " · ".join(parts)
+    note = note_for(s)
+    # flag when a manual edge disagrees with what containment would infer
+    pa = s.get("parent_auto")
+    if s.get("parent_source") == "manual" and pa and pa != s.get("parent"):
+        note = (note + "  " if note else "") + f"⚠ auto:{pa[:8]}"
+    left = f"{prefix}{connector}{name}  {meta}" + (f"  {note}" if note else "")
+    out = (c(prefix + connector, "2;37") + c(name, "1;36") + "  " + c(meta, "2;37")
+           + (("  " + c(note, "2;33")) if note else ""))
+    desc = describe(s, term_w - len(left) - 3)
+    if desc:
+        out += "  " + c(desc, "2;37")
+    print(out)
+    ch = kids.get(sid, [])
+    child_prefix = "" if depth == 0 else prefix + ("   " if is_last else "│  ")
+    for i, cid in enumerate(ch):
+        render(cid, child_prefix, i == len(ch) - 1, depth + 1)
+
+if not sessions:
+    print("(no sessions found)")
+else:
+    for i, r in enumerate(roots):
+        if i: print()
+        render(r, "", True, 0)
+    any_auto = any(s.get("parent_source") == "auto" for s in sessions)
+    if had_pruned or any_auto:
+        print()
+        if any_auto:
+            print(c("┄ dotted = inferred from shared history (a guess); ─ solid = manually confirmed", "2;37"))
+        if had_pruned:
+            print(c("⟵ = forked from a parent Claude has since pruned (lineage preserved)", "2;37"))
+PYEOF
+}
+
+# --- resolve a target (alias | full id | short id) to "id\tcwd" ---------------
+resolve() {
+  local target="$1"
+  scan_if_stale
+  CL_SESSIONS="$CL_SESSIONS" CL_ALIASES="$CL_ALIASES" CL_TARGET="$target" "$PY" - <<'PYEOF'
+import json, os, sys
+
+target = os.environ["CL_TARGET"]
+sessions = json.load(open(os.environ["CL_SESSIONS"]))["sessions"]
+aliases = {}
+ap = os.environ["CL_ALIASES"]
+if os.path.exists(ap):
+    try:
+        aliases = json.load(open(ap)) or {}
+    except Exception:
+        pass
+
+# alias takes precedence
+if target in aliases:
+    target = aliases[target]
+
+byid = {s["id"]: s for s in sessions}
+match = None
+if target in byid:
+    match = byid[target]
+else:
+    cands = [s for s in sessions if s["id"].startswith(target)]
+    if len(cands) == 1:
+        match = cands[0]
+    elif len(cands) > 1:
+        sys.stderr.write("ambiguous: %d sessions start with %r\n" % (len(cands), target))
+        sys.exit(3)
+
+if not match:
+    sys.stderr.write("no session matching %r\n" % target)
+    sys.exit(2)
+if not match.get("cwd"):
+    sys.stderr.write("session %s has no recorded path; cannot resume\n" % match["short"])
+    sys.exit(4)
+print("%s\t%s" % (match["id"], match["cwd"]))
+PYEOF
+}
+
+# --- alias management ----------------------------------------------------------
+set_alias() {
+  local name="$1" target="$2"
+  [[ -n "$name" && -n "$target" ]] || die "usage: cl alias <name> <id|short-id>"
+  ensure_dir
+  scan_if_stale
+  # resolve short-id -> full id (best effort; allow raw value too)
+  local resolved
+  resolved=$(resolve "$target" 2>/dev/null | cut -f1)
+  [[ -n "$resolved" ]] || resolved="$target"
+
+  # one alias per session: if this session already has a (different) alias, confirm
+  local existing
+  existing=$(CL_ALIASES="$CL_ALIASES" A_ID="$resolved" A_NAME="$name" "$PY" - <<'PYEOF'
+import json, os
+ap = os.environ["CL_ALIASES"]
+data = {}
+if os.path.exists(ap):
+    try: data = json.load(open(ap)) or {}
+    except Exception: data = {}
+sid, name = os.environ["A_ID"], os.environ["A_NAME"]
+print(", ".join(k for k, v in data.items() if v == sid and k != name))
+PYEOF
+)
+  if [[ -n "$existing" ]]; then
+    print -u2 "cl: session ${resolved:0:8} is already aliased as: $existing"
+    if [[ -t 0 ]]; then
+      if read -q "?cl: replace with '$name'? [y/N] "; then
+        print
+      else
+        print; die "aborted"
+      fi
+    else
+      print -u2 "cl: (non-interactive) replacing"
+    fi
+  fi
+
+  CL_ALIASES="$CL_ALIASES" A_NAME="$name" A_ID="$resolved" "$PY" - <<'PYEOF'
+import json, os
+ap = os.environ["CL_ALIASES"]
+data = {}
+if os.path.exists(ap):
+    try: data = json.load(open(ap)) or {}
+    except Exception: data = {}
+name, sid = os.environ["A_NAME"], os.environ["A_ID"]
+# enforce one alias per session: drop any other names pointing at it, then set
+data = {k: v for k, v in data.items() if v != sid}
+data[name] = sid
+json.dump(data, open(ap, "w"), indent=2)
+print(f"{name} -> {sid}")
+PYEOF
+}
+
+del_alias() {
+  local name="$1"
+  [[ -n "$name" ]] || die "usage: cl unalias <name>"
+  [[ -f "$CL_ALIASES" ]] || die "no aliases file"
+  CL_ALIASES="$CL_ALIASES" A_NAME="$name" "$PY" - <<'PYEOF'
+import json, os
+ap = os.environ["CL_ALIASES"]
+data = json.load(open(ap)) or {}
+n = os.environ["A_NAME"]
+if n in data:
+    del data[n]
+    json.dump(data, open(ap, "w"), indent=2)
+    print(f"removed {n}")
+else:
+    print(f"no such alias: {n}")
+PYEOF
+}
+
+# --- fork provenance: record a known parent->child edge (manual) ---------------
+add_fork() {
+  local parent="$1" child="$2"
+  [[ -n "$parent" && -n "$child" ]] || die "usage: cl add-fork <parent> <child>"
+  ensure_dir
+  scan_if_stale
+  # resolve alias/short-id -> full id; fall back to the raw value (e.g. a pruned
+  # parent's full UUID that isn't in the catalog)
+  local p c
+  p=$(resolve "$parent" 2>/dev/null | cut -f1); [[ -n "$p" ]] || p="$parent"
+  c=$(resolve "$child"  2>/dev/null | cut -f1); [[ -n "$c" ]] || c="$child"
+  [[ "$p" != "$c" ]] || die "a session cannot fork from itself"
+  CL_FORKS="$CL_FORKS" CL_SESSIONS="$CL_SESSIONS" A_PARENT="$p" A_CHILD="$c" "$PY" - <<'PYEOF'
+import json, os, sys
+fp = os.environ["CL_FORKS"]
+parent, child = os.environ["A_PARENT"], os.environ["A_CHILD"]
+
+forks = {}
+if os.path.exists(fp):
+    try: forks = json.load(open(fp)) or {}
+    except Exception: forks = {}
+
+ids = set()
+try:
+    ids = {s["id"] for s in json.load(open(os.environ["CL_SESSIONS"]))["sessions"]}
+except Exception:
+    pass
+
+e = forks.get(child)
+entry = e if isinstance(e, dict) else {}
+if "parent" in entry and not entry.get("manual") and not entry.get("auto"):
+    entry = {entry.get("source", "auto"): entry["parent"]}   # normalize legacy form
+
+# cycle guard: walk effective parents up from `parent`; bail if we reach `child`
+seen, cur = set(), parent
+while cur and cur not in seen:
+    seen.add(cur)
+    if cur == child:
+        sys.stderr.write("cl: that would create a cycle (%s is a descendant of %s)\n"
+                         % (parent[:8], child[:8]))
+        raise SystemExit(1)
+    pe = forks.get(cur) or {}
+    cur = pe.get("manual") or pe.get("auto")
+
+auto = entry.get("auto")
+entry["manual"] = parent
+forks[child] = entry
+tmp = fp + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(forks, fh, indent=2)
+os.replace(tmp, fp)
+
+note = ""
+if auto and auto == parent:
+    note = "  (matches containment ✓)"
+elif auto and auto != parent:
+    note = f"  (overrides containment guess {auto[:8]})"
+print(f"recorded: {child[:8]} forked from {parent[:8]}{note}")
+if child not in ids:
+    sys.stderr.write(f"cl: note: child {child[:8]} isn't a known session yet "
+                     "(edge saved; it'll appear once that session exists)\n")
+PYEOF
+}
+
+rm_fork() {
+  local child="$1"
+  [[ -n "$child" ]] || die "usage: cl rm-fork <child>"
+  scan_if_stale
+  local c
+  c=$(resolve "$child" 2>/dev/null | cut -f1); [[ -n "$c" ]] || c="$child"
+  [[ -f "$CL_FORKS" ]] || die "no forks file"
+  CL_FORKS="$CL_FORKS" A_CHILD="$c" "$PY" - <<'PYEOF'
+import json, os
+fp = os.environ["CL_FORKS"]; child = os.environ["A_CHILD"]
+forks = json.load(open(fp)) or {}
+entry = forks.get(child)
+if isinstance(entry, dict) and entry.get("manual"):
+    del entry["manual"]                      # drop manual; keep auto guess
+    if entry:
+        forks[child] = entry
+    else:
+        forks.pop(child, None)
+    json.dump(forks, open(fp, "w"), indent=2)
+    print(f"removed manual fork edge for {child[:8]} (containment guess, if any, remains)")
+else:
+    print(f"no manual fork edge for {child[:8]}")
+PYEOF
+}
+
+usage() {
+  cat <<EOF
+cl - launch & manage Claude Code sessions
+
+Usage:
+  cl                       launch a fresh claude in the current directory
+  cl ls                    list all sessions (newest first), alias-annotated
+  cl tree                  visualize fork provenance (children under their parent)
+  cl scan                  (re)generate the sessions catalog
+  cl <alias|id|short-id>   cd to the session's path and resume it
+  cl alias <name> <id>     set the alias for a session (one per session; prompts before replacing)
+  cl unalias <name>        remove an alias
+  cl add-fork <parent> <child>   record a known fork edge (manual; coexists with the auto guess)
+  cl rm-fork <child>       remove a manual fork edge (the containment guess remains)
+  cl path                  print the config dir
+  cl help                  this help
+
+Options (may precede the command/target):
+  -n, --dry-run   print the exact command that WOULD run, without running it
+  -f, --fork      when resuming, fork to a new session id (leaves the original
+                  intact); ignored when starting a fresh session
+  --safe          drop --dangerously-skip-permissions for this launch
+
+Launches with --dangerously-skip-permissions by default.
+Set CL_SAFE=1 (or pass --safe) to drop it. Extra args pass through to claude.
+The command line is printed on every launch (dry-run or not) so what you see
+is exactly what executes.
+
+Files:
+  sessions catalog (generated): $CL_SESSIONS
+  alias map (user-curated):     $CL_ALIASES
+EOF
+}
+
+# --- dispatch ------------------------------------------------------------------
+# Pull cl's own options out of the args wherever they appear; everything else
+# (including unknown flags and everything after a literal `--`) is left for the
+# command/passthrough. Short cl flags may be bundled, e.g. -nf.
+setopt extended_glob
+args=()
+while (( $# )); do
+  case "$1" in
+    -- )           shift; args+=("$@"); break ;;
+    --dry-run )    DRYRUN=1 ;;
+    --fork )       FORK=1 ;;
+    --safe )       DANGER_FLAG=() ;;
+    --help )       usage; exit 0 ;;
+    -[nfh]## )     # one or more bundled cl short flags: -n -f -h -nf -fn ...
+      rest="${1#-}"
+      for (( i = 1; i <= ${#rest}; i++ )); do
+        case "${rest[i]}" in
+          n ) DRYRUN=1 ;;
+          f ) FORK=1 ;;
+          h ) usage; exit 0 ;;
+        esac
+      done
+      ;;
+    * )            args+=("$1") ;;
+  esac
+  shift
+done
+set -- "${args[@]}"
+
+cmd="${1:-}"
+case "$cmd" in
+  "" )
+    (( FORK )) && print -u2 "cl: -f/--fork ignored (nothing to resume; starting a fresh session)"
+    launch "" "${DANGER_FLAG[@]}"
+    ;;
+  ls|list )
+    list_sessions
+    ;;
+  tree )
+    tree_sessions
+    ;;
+  scan|refresh )
+    scan
+    ;;
+  alias )
+    shift; set_alias "${1:-}" "${2:-}"
+    ;;
+  unalias )
+    shift; del_alias "${1:-}"
+    ;;
+  add-fork )
+    shift; add_fork "${1:-}" "${2:-}"
+    ;;
+  rm-fork )
+    shift; rm_fork "${1:-}"
+    ;;
+  path )
+    print "$CL_DIR"
+    ;;
+  help )
+    usage
+    ;;
+  * )
+    # treat as a resume target; pass any trailing args to claude
+    target="$1"; shift
+    line=$(resolve "$target") || exit $?
+    sid="${line%%	*}"
+    cwd="${line#*	}"
+    fork_flag=()
+    (( FORK )) && fork_flag=(--fork-session)
+    launch "$cwd" "${DANGER_FLAG[@]}" "${fork_flag[@]}" --resume "$sid" "$@"
+    ;;
+esac

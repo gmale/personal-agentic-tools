@@ -1,2 +1,2 @@
 # personal-agentic-tools
-Personal tooling that helps when I'm doing agentic things at home or work. Nothing sensitive, nothing ground-breaking. Just things that make my life easier when I'm using a keyboard and AI.
+Personal tooling that helps when I'm doing agentic things at home or work. Nothing sensitive, nothing ground-breaking. I probably vibe-coded each file in less than 5 minutes and yolo'd it to `main`. In other words, these are tools and scripts I freely give away in the spirit of truly "open" source. I make no personal or commercial claims to anything in this repository. These are just things that make my life easier when I'm using a keyboard and AI. 

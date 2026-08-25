@@ -16,10 +16,15 @@
 #   cl ls                    list all sessions (newest first), alias-annotated
 #   cl scan                  (re)generate the sessions catalog
 #   cl <alias|id|short-id>   cd to the session's path and resume it
+#   cl last [<target>]       print a session's last user prompt (default: newest session)
+#   cl last:response [<target>]  print a session's last assistant response
 #   cl alias <name> <id>     map an alias to a session id (creates/updates aliases.json)
 #   cl unalias <name>        remove an alias
 #   cl path                  print the config dir
 #   cl help                  this help
+#
+# Ids match by prefix first, then substring anywhere in the id; when several
+# sessions match, a numbered candidate list is offered for selection.
 #
 # Any extra args after a known form are passed through to `claude`.
 # Set CL_SAFE=1 (or pass --safe) to drop --dangerously-skip-permissions.
@@ -74,7 +79,7 @@ ensure_dir() { [[ -d "$CL_DIR" ]] || mkdir -p "$CL_DIR"; }
 scan() {
   ensure_dir
   PROJECTS_DIR="$PROJECTS_DIR" CL_SESSIONS="$CL_SESSIONS" CL_FORKS="$CL_FORKS" "$PY" - <<'PYEOF'
-import json, os, glob, datetime
+import json, os, glob, datetime, re
 
 projects = os.environ["PROJECTS_DIR"]
 out_path = os.environ["CL_SESSIONS"]
@@ -86,6 +91,9 @@ CONTAIN_THR = 0.98  # A is an ancestor of B if >= this fraction of A's history i
 # prefixes that mark a system-injected / resume preamble rather than a real ask
 NOISE = ("this session is being continued", "<local-command", "<command-",
          "caveat:", "<system-reminder", "welcome back")
+
+SID_RE = re.compile(r'session_id\\?":\\?"([0-9a-f-]{36})')
+ORIGIN_RE = re.compile(r'originSessionId\\?"?[:\s]+\\?"?([0-9a-f-]{36})')
 
 def msg_text(m):
     if not isinstance(m, dict):
@@ -111,12 +119,25 @@ for f in glob.glob(os.path.join(projects, "*", "*.jsonl")):
     compactions = 0         # number of compaction events
     logical_parent = None   # logicalParentUuid (branch root, for orphan annotation)
     muuids = set()          # this session's message uuids
+    sid_seq = []            # uniq-collapsed content-embedded session_id values, in file order
+    origin_root = None      # first originSessionId seen (memory-file provenance -> ROOT hint, not parent)
     try:
         with open(f, "r", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
                     continue
+                # Lineage signals live in CONTENT (they survive fork restamping):
+                # embedded snake_case session_id values appear in lineage order
+                # (root era first ... then current). Collect uniq-collapsed.
+                for m in SID_RE.finditer(line):
+                    v = m.group(1)
+                    if not sid_seq or sid_seq[-1] != v:
+                        sid_seq.append(v)
+                if origin_root is None:
+                    om = ORIGIN_RE.search(line)
+                    if om:
+                        origin_root = om.group(1)
                 try:
                     d = json.loads(line)
                 except Exception:
@@ -158,6 +179,21 @@ for f in glob.glob(os.path.join(projects, "*", "*.jsonl")):
     except Exception:
         pass
 
+    # Direct parent from the content walk (verified 2026-08-25 on a
+    # 3-deep fork chain): the value immediately BEFORE this session's id
+    # first appears; for young forks whose own id has not yet been
+    # embedded in any content, the LAST value in the sequence.
+    content_parent = None
+    if sid_seq:
+        if sid in sid_seq:
+            i = sid_seq.index(sid)
+            if i > 0:
+                content_parent = sid_seq[i - 1]
+        else:
+            content_parent = sid_seq[-1]
+    if content_parent == sid:
+        content_parent = None
+
     uuid_sets[sid] = muuids
     sessions.append({
         "id": sid,
@@ -171,13 +207,25 @@ for f in glob.glob(os.path.join(projects, "*", "*.jsonl")):
         "ctx_tokens": ctx_tokens,
         "compactions": compactions,
         "_logical_parent": logical_parent,    # internal: consumed below
+        "_content_parent": content_parent,    # internal: consumed below
+        "origin_root": origin_root,           # ROOT-ward hint (memory provenance), never a parent claim
+        "lineage": sid_seq[:12],              # ancestor id walk, oldest first (uniq-collapsed)
     })
 
 # --- resolve provenance: child -> parent session ------------------------------
-# Forks copy the whole ancestry's messages (uuids included), so a single uuid
-# lives in every descendant -- "who owns this uuid" is meaningless. Instead infer
-# ancestry by containment: A is an ancestor of B when ~all of A's message history
-# is also in B; the immediate parent is the *largest* such contained ancestor.
+# Two auto signals, in priority order:
+#   1. CONTENT WALK (primary): forks restamp every line's sessionId but copy
+#      message CONTENT verbatim, and harness-generated content embeds snake_case
+#      session_id strings; those values appear in lineage order, so the direct
+#      parent is the value just before this session's id first appears (or the
+#      last value, for young forks). Self-contained; no cross-file comparison.
+#   2. CONTAINMENT (fallback, for transcripts embedding no ids): forks copy the
+#      whole ancestry's messages (uuids included), so "who owns this uuid" is
+#      meaningless, but A is an ancestor of B when ~all of A's history is in B;
+#      the immediate parent is the *largest* contained ancestor.
+# NOT a parent signal: originSessionId — it is memory-file provenance (which
+# session authored a memory) and points root-ward, not parent-ward; it is kept
+# per-session as origin_root purely as a root hint.
 present = {s["id"] for s in sessions}
 
 def containment_parent(bid):
@@ -218,7 +266,7 @@ manual_count = auto_count = 0
 for s in sessions:
     sid = s["id"]
     entry = forks.get(sid, {})
-    derived = containment_parent(sid)
+    derived = s.get("_content_parent") or containment_parent(sid)
     if derived:
         entry["auto"] = derived                          # refresh the guess
     else:
@@ -237,6 +285,7 @@ for s in sessions:
     s["parent_present"] = bool(parent) and parent in present
     if manual: manual_count += 1
     elif auto: auto_count += 1
+    s.pop("_content_parent", None)
     lp = s.pop("_logical_parent")
     s["branch_uuid"] = lp[:8] if lp else None
 
@@ -522,7 +571,10 @@ else:
 PYEOF
 }
 
-# --- resolve a target (alias | full id | short id) to "id\tcwd" ---------------
+# --- resolve a target (alias | full id | short id | id fragment) to "id\tcwd" --
+# Ids match by prefix first, then substring. On multiple matches: with CL_PICK=1
+# a numbered menu is offered on the tty; otherwise the candidates are listed and
+# it exits 3. CL_NEED_CWD=0 skips the "has a path" requirement (e.g. for `last`).
 resolve() {
   local target="$1"
   scan_if_stale
@@ -530,6 +582,8 @@ resolve() {
 import json, os, sys
 
 target = os.environ["CL_TARGET"]
+pick = os.environ.get("CL_PICK") == "1"
+need_cwd = os.environ.get("CL_NEED_CWD", "1") == "1"
 sessions = json.load(open(os.environ["CL_SESSIONS"]))["sessions"]
 aliases = {}
 ap = os.environ["CL_ALIASES"]
@@ -544,24 +598,134 @@ if target in aliases:
     target = aliases[target]
 
 byid = {s["id"]: s for s in sessions}
-match = None
 if target in byid:
-    match = byid[target]
+    cands = [byid[target]]
 else:
-    cands = [s for s in sessions if s["id"].startswith(target)]
-    if len(cands) == 1:
-        match = cands[0]
-    elif len(cands) > 1:
-        sys.stderr.write("ambiguous: %d sessions start with %r\n" % (len(cands), target))
-        sys.exit(3)
+    t = target.lower()
+    cands = [s for s in sessions if s["id"].startswith(t)]
+    if not cands:
+        cands = [s for s in sessions if t in s["id"]]
 
-if not match:
+if not cands:
     sys.stderr.write("no session matching %r\n" % target)
     sys.exit(2)
-if not match.get("cwd"):
+
+if len(cands) == 1:
+    match = cands[0]
+else:
+    err = sys.stderr
+    err.write("%d sessions match %r:\n" % (len(cands), target))
+    home = os.path.expanduser("~")
+    for i, s in enumerate(cands, 1):
+        when = (s.get("last_used") or "-")[:16].replace("T", " ")
+        path = s.get("cwd") or "(no path)"
+        if path.startswith(home):
+            path = "~" + path[len(home):]
+        err.write("  %2d) %s  %s  %s\n" % (i, s["short"], when, path))
+        desc = s.get("last") or s.get("first") or s.get("title") or ""
+        if desc:
+            err.write("      %s\n" % (desc if len(desc) <= 70 else desc[:69] + "…"))
+    tty = None
+    if pick:
+        try:
+            tty = open("/dev/tty")
+        except OSError:
+            pass
+    if tty is None:
+        sys.exit(3)
+    err.write("select [1-%d]: " % len(cands))
+    err.flush()
+    choice = tty.readline().strip()
+    if not choice.isdigit() or not (1 <= int(choice) <= len(cands)):
+        err.write("aborted\n")
+        sys.exit(3)
+    match = cands[int(choice) - 1]
+
+if need_cwd and not match.get("cwd"):
     sys.stderr.write("session %s has no recorded path; cannot resume\n" % match["short"])
     sys.exit(4)
-print("%s\t%s" % (match["id"], match["cwd"]))
+print("%s\t%s" % (match["id"], match.get("cwd") or ""))
+PYEOF
+}
+
+# --- last / last:response: print a session's final prompt or reply ------------
+show_last() {
+  local kind="$1" target="${2:-}"
+  local sid
+  if [[ -n "$target" ]]; then
+    local line
+    line=$(CL_PICK=1 CL_NEED_CWD=0 resolve "$target") || exit $?
+    sid="${line%%	*}"
+  else
+    # no target: newest session (catalog is sorted newest-first)
+    scan_if_stale
+    sid=$(CL_SESSIONS="$CL_SESSIONS" "$PY" -c \
+      'import json,os; s=json.load(open(os.environ["CL_SESSIONS"]))["sessions"]; print(s[0]["id"] if s else "")')
+    [[ -n "$sid" ]] || die "no sessions found"
+  fi
+  local -a files
+  files=("$PROJECTS_DIR"/*/"$sid".jsonl(N))
+  (( ${#files} )) || die "no transcript for session ${sid:0:8}"
+  CL_KIND="$kind" "$PY" - "${files[1]}" <<'PYEOF'
+import json, os, sys
+
+path = sys.argv[1]
+kind = os.environ["CL_KIND"]   # "prompt" | "response"
+
+NOISE = ("this session is being continued", "<local-command", "<command-",
+         "caveat:", "<system-reminder", "welcome back")
+
+last_prompt = None
+last_response = None
+resp_id = None      # assistant message id of the group being accumulated
+resp_parts = []     # its text blocks (one streamed entry per block, same id)
+
+with open(path, "r", errors="replace") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("isSidechain") or d.get("isMeta"):
+            continue
+        m = d.get("message")
+        if not isinstance(m, dict):
+            continue
+        typ = d.get("type")
+        if typ == "user":
+            c = m.get("content")
+            txt = None
+            if isinstance(c, str):
+                txt = c
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        txt = part.get("text")
+                        break
+            if txt:
+                clean = " ".join(txt.split())
+                if clean and not clean.lower().startswith(NOISE):
+                    last_prompt = txt.strip()
+        elif typ == "assistant":
+            parts = [p.get("text") for p in (m.get("content") or [])
+                     if isinstance(p, dict) and p.get("type") == "text" and p.get("text")]
+            if parts:
+                mid = m.get("id")
+                if mid and mid == resp_id:
+                    resp_parts.extend(parts)
+                else:
+                    resp_id, resp_parts = mid, list(parts)
+                last_response = "\n\n".join(resp_parts).strip()
+
+out = last_prompt if kind == "prompt" else last_response
+if not out:
+    sys.stderr.write("no %s found in transcript\n"
+                     % ("user prompt" if kind == "prompt" else "assistant response"))
+    sys.exit(1)
+print(out)
 PYEOF
 }
 
@@ -735,6 +899,8 @@ Usage:
   cl tree                  visualize fork provenance (children under their parent)
   cl scan                  (re)generate the sessions catalog
   cl <alias|id|short-id>   cd to the session's path and resume it
+  cl last [<target>]       print a session's last user prompt (default: newest session)
+  cl last:response [<target>]    print a session's last assistant response
   cl alias <name> <id>     set the alias for a session (one per session; prompts before replacing)
   cl unalias <name>        remove an alias
   cl add-fork <parent> <child>   record a known fork edge (manual; coexists with the auto guess)
@@ -747,6 +913,9 @@ Options (may precede the command/target):
   -f, --fork      when resuming, fork to a new session id (leaves the original
                   intact); ignored when starting a fresh session
   --safe          drop --dangerously-skip-permissions for this launch
+
+Ids match by prefix first, then substring anywhere in the id; when several
+sessions match, a numbered candidate list is offered for selection.
 
 Launches with --dangerously-skip-permissions by default.
 Set CL_SAFE=1 (or pass --safe) to drop it. Extra args pass through to claude.
@@ -803,6 +972,12 @@ case "$cmd" in
   scan|refresh )
     scan
     ;;
+  last|last:prompt )
+    shift; show_last prompt "${1:-}"
+    ;;
+  last:response )
+    shift; show_last response "${1:-}"
+    ;;
   alias )
     shift; set_alias "${1:-}" "${2:-}"
     ;;
@@ -824,7 +999,7 @@ case "$cmd" in
   * )
     # treat as a resume target; pass any trailing args to claude
     target="$1"; shift
-    line=$(resolve "$target") || exit $?
+    line=$(CL_PICK=1 resolve "$target") || exit $?
     sid="${line%%	*}"
     cwd="${line#*	}"
     fork_flag=()
